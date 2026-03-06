@@ -1,0 +1,31 @@
+services:
+  openai-pool:
+    image: xxx
+    container_name: openai-pool
+    restart: unless-stopped
+    ports:
+      - "18421:18421"
+    volumes:
+      # 使用 Docker 管理的命名卷，挂载时如果外部是空的，会自动把镜像内自带的初始化文件复制到这个卷里
+      - pool_data:/app/data
+      - pool_config:/app/config
+
+    # 如需代理，取消下方注释并修改地址
+    # command: ["--proxy", "http://host.docker.internal:10808"]
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+# 定义命名卷（支持自动初始化到指定的宿主机物理目录）
+volumes:
+  pool_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data
+  pool_config:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./config
