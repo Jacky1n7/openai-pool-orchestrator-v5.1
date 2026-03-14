@@ -18,6 +18,14 @@ const state = {
     status: 'all',
     keyword: '',
   },
+  tokenTest: {
+    filename: '',
+    email: '',
+    model: 'gpt-5-2',
+    prompt: 'hi',
+    running: false,
+    hasRun: false,
+  },
   stepsInRun: false,       // 是否处于一轮步骤追踪中（避免多线程 start 互相清空）
   _loadTokensTimer: null,  // 节流处理专用 timer
 };
@@ -27,6 +35,10 @@ const state = {
 // ==========================================
 const $ = id => document.getElementById(id);
 const DOM = {};
+const TOKEN_TEST_MODEL_LABELS = {
+  'gpt-5-2': 'gpt-5.2',
+  'gpt-5-3': 'gpt-5.3',
+};
 
 const STEPS = [
   { id: 'check_proxy', label: '网络检查' },
@@ -115,7 +127,23 @@ document.addEventListener('DOMContentLoaded', () => {
     poolTokenList: $('poolTokenList'),
     poolTokenCount: $('poolTokenCount'),
     poolCopyRtBtn: $('poolCopyRtBtn'),
+    tokenCheckBtn: $('tokenCheckBtn'),
+    tokenCleanupBtn: $('tokenCleanupBtn'),
+    tokenMaintainStatus: $('tokenMaintainStatus'),
+    poolBatchImportMode: $('poolBatchImportMode'),
     poolPwSyncBtn: $('poolPwSyncBtn'),
+    tokenTestModal: $('tokenTestModal'),
+    tokenTestBackdrop: $('tokenTestBackdrop'),
+    tokenTestCloseBtn: $('tokenTestCloseBtn'),
+    tokenTestCancelBtn: $('tokenTestCancelBtn'),
+    tokenTestRetryBtn: $('tokenTestRetryBtn'),
+    tokenTestEmail: $('tokenTestEmail'),
+    tokenTestStatusBadge: $('tokenTestStatusBadge'),
+    tokenTestModelSelect: $('tokenTestModelSelect'),
+    tokenTestPromptInput: $('tokenTestPromptInput'),
+    tokenTestLog: $('tokenTestLog'),
+    tokenTestMetaLabel: $('tokenTestMetaLabel'),
+    tokenTestMetaHint: $('tokenTestMetaHint'),
     tokenFilterStatus: $('tokenFilterStatus'),
     tokenFilterKeyword: $('tokenFilterKeyword'),
     tokenFilterApplyBtn: $('tokenFilterApplyBtn'),
@@ -183,7 +211,21 @@ document.addEventListener('DOMContentLoaded', () => {
   DOM.poolRefreshBtn.addEventListener('click', pollPoolStatus);
   DOM.poolMaintainBtn.addEventListener('click', triggerMaintenance);
   if (DOM.poolCopyRtBtn) DOM.poolCopyRtBtn.addEventListener('click', copyAllRt);
+  if (DOM.tokenCheckBtn) DOM.tokenCheckBtn.addEventListener('click', () => maintainLocalTokens(false));
+  if (DOM.tokenCleanupBtn) DOM.tokenCleanupBtn.addEventListener('click', () => maintainLocalTokens(true));
   if (DOM.poolPwSyncBtn) DOM.poolPwSyncBtn.addEventListener('click', batchSync);
+  if (DOM.tokenTestCloseBtn) DOM.tokenTestCloseBtn.addEventListener('click', closeTokenTestModal);
+  if (DOM.tokenTestCancelBtn) DOM.tokenTestCancelBtn.addEventListener('click', closeTokenTestModal);
+  if (DOM.tokenTestBackdrop) DOM.tokenTestBackdrop.addEventListener('click', closeTokenTestModal);
+  if (DOM.tokenTestRetryBtn) DOM.tokenTestRetryBtn.addEventListener('click', retryTokenTest);
+  if (DOM.tokenTestModelSelect) DOM.tokenTestModelSelect.addEventListener('change', () => {
+    state.tokenTest.model = DOM.tokenTestModelSelect.value;
+    updateTokenTestMeta();
+  });
+  if (DOM.tokenTestPromptInput) DOM.tokenTestPromptInput.addEventListener('input', () => {
+    state.tokenTest.prompt = DOM.tokenTestPromptInput.value;
+    updateTokenTestMeta();
+  });
   if (DOM.tokenFilterApplyBtn) DOM.tokenFilterApplyBtn.addEventListener('click', applyTokenFilter);
   if (DOM.tokenFilterResetBtn) DOM.tokenFilterResetBtn.addEventListener('click', resetTokenFilter);
   if (DOM.tokenFilterKeyword) {
@@ -213,6 +255,13 @@ document.addEventListener('DOMContentLoaded', () => {
       if (deleteBtn) {
         const filename = decodeURIComponent(deleteBtn.dataset.filename || '');
         if (filename) deleteToken(filename);
+        return;
+      }
+      const testBtn = e.target.closest('.token-test-btn');
+      if (testBtn) {
+        const filename = decodeURIComponent(testBtn.dataset.filename || '');
+        const email = decodeURIComponent(testBtn.dataset.email || '');
+        if (filename) openTokenTestModal({ filename, email });
       }
     });
   }
@@ -563,8 +612,8 @@ function getFilteredTokens(tokens) {
     const uploaded = platforms.length > 0;
     if (status === 'synced' && !uploaded) return false;
     if (status === 'unsynced' && uploaded) return false;
-    if (status === 'cpa' && !platforms.includes('cpa')) return false;
-    if (status === 'sub2api' && !platforms.includes('sub2api')) return false;
+    if (status === 'cpa' && !(platforms.length === 1 && platforms[0] === 'cpa')) return false;
+    if (status === 'sub2api' && !(platforms.length === 1 && platforms[0] === 'sub2api')) return false;
     if (status === 'both' && !(platforms.includes('cpa') && platforms.includes('sub2api'))) return false;
 
     if (!keyword) return true;
@@ -637,6 +686,7 @@ function renderTokenItem(t) {
         <div class="token-meta">过期: ${expiredStr}</div>
       </div>
       <div class="token-actions">
+        <button class="btn btn-success btn-sm token-test-btn" data-filename="${filePayload}" data-email="${encodeURIComponent(t.email || t.filename || '')}">测试</button>
         <button class="btn btn-ghost btn-sm token-copy-btn" data-payload="${tokenPayload}">复制</button>
         <button class="btn btn-danger btn-sm token-delete-btn" data-filename="${filePayload}">删除</button>
       </div>
@@ -684,6 +734,53 @@ async function copyAllRt() {
   } catch (e) { showToast('复制失败: ' + e.message, 'error'); }
 }
 
+async function maintainLocalTokens(deleteInvalid = false) {
+  const visibleTokens = getFilteredTokens(state.tokens || []);
+  const filenames = visibleTokens.map(t => t.filename).filter(Boolean);
+  if (filenames.length === 0) {
+    showToast('当前筛选下没有可处理的本地 Token', 'error');
+    return;
+  }
+  if (deleteInvalid && !confirm(`确认校验并清理当前筛选下的 ${filenames.length} 个本地 Token 吗？`)) return;
+
+  const actionBtn = deleteInvalid ? DOM.tokenCleanupBtn : DOM.tokenCheckBtn;
+  const siblingBtn = deleteInvalid ? DOM.tokenCheckBtn : DOM.tokenCleanupBtn;
+  if (actionBtn) actionBtn.disabled = true;
+  if (siblingBtn) siblingBtn.disabled = true;
+  if (DOM.tokenMaintainStatus) {
+    DOM.tokenMaintainStatus.textContent = deleteInvalid
+      ? `正在校验并清理 ${filenames.length} 个本地 Token...`
+      : `正在校验 ${filenames.length} 个本地 Token...`;
+  }
+  try {
+    const res = await fetch('/api/tokens/maintain', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filenames, delete_invalid: deleteInvalid }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      const msg = data.detail || '本地 Token 处理失败';
+      if (DOM.tokenMaintainStatus) DOM.tokenMaintainStatus.textContent = msg;
+      showToast(msg, 'error');
+      return;
+    }
+    const msg = deleteInvalid
+      ? `校验完成：有效 ${data.valid}，异常 ${data.invalid}，已删除 ${data.deleted}，已刷新 ${data.updated}`
+      : `校验完成：有效 ${data.valid}，异常 ${data.invalid}，已刷新 ${data.updated}，探测异常 ${data.probe_errors}`;
+    if (DOM.tokenMaintainStatus) DOM.tokenMaintainStatus.textContent = msg;
+    showToast(msg, data.invalid > 0 ? 'info' : 'success');
+    await loadTokens();
+  } catch (e) {
+    const msg = '请求失败: ' + e.message;
+    if (DOM.tokenMaintainStatus) DOM.tokenMaintainStatus.textContent = msg;
+    showToast(msg, 'error');
+  } finally {
+    if (actionBtn) actionBtn.disabled = false;
+    if (siblingBtn) siblingBtn.disabled = false;
+  }
+}
+
 async function deleteToken(filename) {
   if (!confirm(`确认删除 ${filename}？`)) return;
   try {
@@ -704,7 +801,7 @@ async function loadSyncConfig() {
     DOM.sub2apiBaseUrl.value = cfg.base_url || '';
     if (cfg.email) DOM.sub2apiEmail.value = cfg.email;
     DOM.autoSyncCheck.checked = cfg.auto_sync !== 'false';
-    if (DOM.uploadMode) DOM.uploadMode.value = cfg.upload_mode || 'snapshot';
+    if (DOM.uploadMode) DOM.uploadMode.value = cfg.upload_mode || 'parallel';
     if (DOM.uploadModeStatus) DOM.uploadModeStatus.textContent = '';
     if (DOM.sub2apiMinCandidates) DOM.sub2apiMinCandidates.value = cfg.sub2api_min_candidates || 200;
     if (DOM.sub2apiInterval) DOM.sub2apiInterval.value = cfg.sub2api_maintain_interval_minutes || 30;
@@ -792,7 +889,7 @@ async function saveSyncConfig() {
   const email = DOM.sub2apiEmail.value.trim();
   const password = DOM.sub2apiPassword.value.trim();
   const auto_sync = DOM.autoSyncCheck.checked ? 'true' : 'false';
-  const upload_mode = DOM.uploadMode ? DOM.uploadMode.value : 'snapshot';
+  const upload_mode = DOM.uploadMode ? DOM.uploadMode.value : 'parallel';
   const sub2api_min_candidates = parseInt(DOM.sub2apiMinCandidates.value) || 200;
   const sub2api_auto_maintain = DOM.sub2apiAutoMaintain.checked;
   const sub2api_maintain_interval_minutes = parseInt(DOM.sub2apiInterval.value) || 30;
@@ -836,7 +933,7 @@ async function saveSyncConfig() {
 }
 
 async function saveUploadMode() {
-  const upload_mode = DOM.uploadMode ? DOM.uploadMode.value : 'snapshot';
+  const upload_mode = DOM.uploadMode ? DOM.uploadMode.value : 'parallel';
   if (!DOM.uploadModeSaveBtn) return;
   DOM.uploadModeSaveBtn.disabled = true;
   const oldText = DOM.uploadModeSaveBtn.textContent;
@@ -855,7 +952,9 @@ async function saveUploadMode() {
       if (DOM.uploadModeStatus) DOM.uploadModeStatus.textContent = msg;
       return;
     }
-    const label = upload_mode === 'decoupled' ? '双平台同传（单账号双上传）' : '串行补平台（先CPA后Sub2Api）';
+    let label = '双平台并行上传';
+    if (upload_mode === 'cpa_only') label = '仅上传 CPA';
+    else if (upload_mode === 'sub2api_only') label = '仅上传 Sub2Api';
     showToast('上传策略已保存：' + label, 'success');
     if (DOM.uploadModeStatus) DOM.uploadModeStatus.textContent = '已保存：' + label;
   } catch (e) {
@@ -870,24 +969,195 @@ async function saveUploadMode() {
 async function batchSync() {
   const btn = DOM.poolPwSyncBtn;
   if (!btn) return;
+  const mode = DOM.poolBatchImportMode ? DOM.poolBatchImportMode.value : 'sub2api_only';
+  const visibleTokens = getFilteredTokens(state.tokens || []);
+  const filenames = visibleTokens.map(t => t.filename).filter(Boolean);
+  if (filenames.length === 0) {
+    showToast('当前筛选下没有可导入的 Token', 'error');
+    return;
+  }
   btn.disabled = true;
   btn.textContent = '导入中...';
-  showToast('批量导入开始', 'info');
+  if (DOM.poolBatchImportMode) DOM.poolBatchImportMode.disabled = true;
+  let modeLabel = 'Sub2Api';
+  if (mode === 'cpa_only') modeLabel = 'CPA';
+  else if (mode === 'parallel') modeLabel = '双平台';
+  showToast(`批量导入开始（${modeLabel}）`, 'info');
   try {
-    const res = await fetch('/api/sync-batch', {
+    const res = await fetch('/api/tokens/import-batch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filenames: [] }),
+      body: JSON.stringify({ filenames, mode }),
     });
     const data = await res.json();
     if (!res.ok) { showToast(data.detail || '导入失败', 'error'); return; }
-    const msg = `导入完成：共 ${data.total}，成功 ${data.ok}，失败 ${data.fail}`;
+    const msg = `导入完成：共 ${data.total}，成功 ${data.ok}，失败 ${data.fail}（${modeLabel}）`;
     showToast(msg, data.fail > 0 ? 'info' : 'success');
+    await loadTokens();
   } catch (e) {
     showToast('导入失败: ' + e.message, 'error');
   } finally {
     btn.disabled = false;
+    if (DOM.poolBatchImportMode) DOM.poolBatchImportMode.disabled = false;
     btn.textContent = '批量导入';
+  }
+}
+
+function updateTokenTestMeta() {
+  const modelLabel = TOKEN_TEST_MODEL_LABELS[state.tokenTest.model] || state.tokenTest.model || '--';
+  if (DOM.tokenTestMetaLabel) DOM.tokenTestMetaLabel.textContent = `测试模型：${modelLabel}`;
+  if (DOM.tokenTestMetaHint) DOM.tokenTestMetaHint.textContent = `提示词：${JSON.stringify(state.tokenTest.prompt || '')}`;
+}
+
+function updateTokenTestActionLabel() {
+  if (!DOM.tokenTestRetryBtn) return;
+  DOM.tokenTestRetryBtn.textContent = state.tokenTest.hasRun ? '重试' : '开始测试';
+}
+
+function setTokenTestStatus(status) {
+  if (!DOM.tokenTestStatusBadge) return;
+  DOM.tokenTestStatusBadge.className = `token-test-status ${status}`;
+  DOM.tokenTestStatusBadge.textContent = status;
+}
+
+function setTokenTestLog(lines) {
+  if (!DOM.tokenTestLog) return;
+  DOM.tokenTestLog.innerHTML = lines.map(line => {
+    const level = line.level || 'info';
+    return `<div class="token-test-log-line ${level}">${escapeHtml(line.message || '')}</div>`;
+  }).join('');
+  DOM.tokenTestLog.scrollTop = DOM.tokenTestLog.scrollHeight;
+}
+
+function appendTokenTestLog(level, message) {
+  const current = DOM.tokenTestLog ? Array.from(DOM.tokenTestLog.querySelectorAll('.token-test-log-line')).map(node => ({
+    level: node.className.split(' ').slice(-1)[0],
+    message: node.textContent || '',
+  })) : [];
+  current.push({ level, message });
+  setTokenTestLog(current);
+}
+
+function openTokenTestModal({ filename, email }) {
+  state.tokenTest.filename = filename;
+  state.tokenTest.email = email || filename;
+  state.tokenTest.hasRun = false;
+  if (DOM.tokenTestEmail) DOM.tokenTestEmail.textContent = state.tokenTest.email;
+  const initialModelLabel = TOKEN_TEST_MODEL_LABELS[state.tokenTest.model] || state.tokenTest.model;
+  if (DOM.tokenTestModelSelect) DOM.tokenTestModelSelect.innerHTML = `<option value="${escapeHtml(state.tokenTest.model)}">${escapeHtml(initialModelLabel)}</option>`;
+  if (DOM.tokenTestModelSelect) DOM.tokenTestModelSelect.value = state.tokenTest.model;
+  if (DOM.tokenTestPromptInput) DOM.tokenTestPromptInput.value = state.tokenTest.prompt;
+  updateTokenTestMeta();
+  updateTokenTestActionLabel();
+  setTokenTestStatus('idle');
+  setTokenTestLog([
+    { level: 'info', message: `准备测试本地 Token：${state.tokenTest.email}` },
+    { level: 'info', message: '正在获取可用模型列表...' },
+  ]);
+  if (DOM.tokenTestModal) DOM.tokenTestModal.hidden = false;
+  loadTokenTestModels();
+}
+
+function closeTokenTestModal() {
+  if (state.tokenTest.running) return;
+  if (DOM.tokenTestModal) DOM.tokenTestModal.hidden = true;
+}
+
+async function retryTokenTest() {
+  if (!state.tokenTest.filename || state.tokenTest.running) return;
+  await runTokenTest();
+}
+
+async function loadTokenTestModels() {
+  if (!state.tokenTest.filename) return;
+  try {
+    const res = await fetch('/api/tokens/test-models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: state.tokenTest.filename }),
+    });
+    const data = await res.json();
+    if (Array.isArray(data.models) && data.models.length > 0 && DOM.tokenTestModelSelect) {
+      DOM.tokenTestModelSelect.innerHTML = data.models
+        .map(model => `<option value="${escapeHtml(model)}">${escapeHtml(TOKEN_TEST_MODEL_LABELS[model] || model)}</option>`)
+        .join('');
+      if (data.models.includes(state.tokenTest.model)) {
+        DOM.tokenTestModelSelect.value = state.tokenTest.model;
+      } else {
+        state.tokenTest.model = data.models.includes('gpt-5-2') ? 'gpt-5-2' : data.models[0];
+        DOM.tokenTestModelSelect.value = state.tokenTest.model;
+      }
+      updateTokenTestMeta();
+    }
+    let firstLine = '模型列表获取失败，已使用兜底模型列表';
+    if (data.source === 'chatgpt') firstLine = '已通过 ChatGPT/Codex 接口获取可用模型列表';
+    else if (data.source === 'probe') firstLine = '已通过实际探测获取可用模型列表';
+    const lines = [{ level: data.ok ? 'success' : 'info', message: firstLine }];
+    if (data.warning) lines.push({ level: 'info', message: `提示：${data.warning}` });
+    lines.push({ level: 'info', message: '点击“开始测试”后才会真正发起测试。' });
+    setTokenTestLog(lines);
+  } catch (e) {
+    setTokenTestLog([
+      { level: 'error', message: '模型列表获取失败：' + e.message },
+      { level: 'info', message: '点击“开始测试”后会继续使用当前模型。' },
+    ]);
+  }
+}
+
+async function runTokenTest() {
+  if (!state.tokenTest.filename) return;
+  state.tokenTest.model = DOM.tokenTestModelSelect ? DOM.tokenTestModelSelect.value : state.tokenTest.model;
+  state.tokenTest.prompt = DOM.tokenTestPromptInput ? DOM.tokenTestPromptInput.value : state.tokenTest.prompt;
+  updateTokenTestMeta();
+  state.tokenTest.hasRun = true;
+  updateTokenTestActionLabel();
+  state.tokenTest.running = true;
+  setTokenTestStatus('running');
+  if (DOM.tokenTestRetryBtn) DOM.tokenTestRetryBtn.disabled = true;
+  if (DOM.tokenTestCancelBtn) DOM.tokenTestCancelBtn.disabled = true;
+  setTokenTestLog([
+    { level: 'info', message: `开始测试账号：${state.tokenTest.email}` },
+    { level: 'info', message: `账号类型：OAUTH` },
+    { level: 'info', message: `使用模型：${state.tokenTest.model}` },
+    { level: 'info', message: `发送测试消息：${JSON.stringify(state.tokenTest.prompt)}` },
+  ]);
+  try {
+    const res = await fetch('/api/tokens/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filename: state.tokenTest.filename,
+        model: state.tokenTest.model,
+        prompt: state.tokenTest.prompt,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      appendTokenTestLog('error', data.detail || '测试失败');
+      setTokenTestStatus('error');
+      return;
+    }
+    const lines = Array.isArray(data.logs) ? data.logs.slice() : [];
+    if (Array.isArray(data.available_models) && data.available_models.length > 0) {
+      lines.push({ level: 'info', message: `可用模型：${data.available_models.slice(0, 8).join(', ')}${data.available_models.length > 8 ? ' ...' : ''}` });
+    }
+    if (data.response_text) {
+      lines.push({ level: 'success', message: '响应：' });
+      lines.push({ level: 'success', message: data.response_text });
+    } else if (data.error) {
+      lines.push({ level: 'error', message: `错误：${data.error}` });
+    }
+    setTokenTestLog(lines);
+    setTokenTestStatus(data.status || (data.ok ? 'active' : 'error'));
+    if (data.ok) showToast(`测试通过：${state.tokenTest.email}`, 'success');
+    else showToast(`测试失败：${state.tokenTest.email}`, 'error');
+  } catch (e) {
+    appendTokenTestLog('error', '请求失败：' + e.message);
+    setTokenTestStatus('error');
+  } finally {
+    state.tokenTest.running = false;
+    if (DOM.tokenTestRetryBtn) DOM.tokenTestRetryBtn.disabled = false;
+    if (DOM.tokenTestCancelBtn) DOM.tokenTestCancelBtn.disabled = false;
   }
 }
 

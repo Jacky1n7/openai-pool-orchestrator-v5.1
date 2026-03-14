@@ -549,6 +549,7 @@ CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
 DEFAULT_REDIRECT_URI = f"http://localhost:1455/auth/callback"
 DEFAULT_SCOPE = "openid email profile offline_access"
+PASSWORD_SPECIAL_CHARS = "!@#$%^&*()-_=+"
 
 
 def _b64url_no_pad(raw: bytes) -> str:
@@ -712,6 +713,20 @@ def generate_oauth_url(
         code_verifier=code_verifier,
         redirect_uri=redirect_uri,
     )
+
+
+def _generate_account_password(length: int = 18) -> str:
+    length = max(12, length)
+    alphabet = string.ascii_letters + string.digits + PASSWORD_SPECIAL_CHARS
+    while True:
+        password = "".join(secrets.choice(alphabet) for _ in range(length))
+        if (
+            any(ch.islower() for ch in password)
+            and any(ch.isupper() for ch in password)
+            and any(ch.isdigit() for ch in password)
+            and any(ch in PASSWORD_SPECIAL_CHARS for ch in password)
+        ):
+            return password
 
 
 def submit_callback_url(
@@ -1316,29 +1331,59 @@ def run(
         emitter.info(f"注册表单提交状态: {signup_resp.status_code}", step="signup")
         if signup_resp.status_code == 409:
             emitter.warn(f"signup 409 响应: {str(signup_resp.text or '')[:220]}", step="signup")
-
-        # ------- 步骤6：发送 OTP 验证码 -------
-        emitter.info("正在发送邮箱验证码...", step="send_otp")
-        otp_resp = _session_post(
-            "https://auth.openai.com/api/accounts/passwordless/send-otp",
-            headers={
-                "referer": "https://auth.openai.com/create-account/password",
-                "accept": "application/json",
-                "content-type": "application/json",
-            },
-        )
-        emitter.info(f"验证码发送状态: {otp_resp.status_code}", step="send_otp")
-        if otp_resp.status_code == 409:
-            emitter.warn(f"send_otp 409 响应: {str(otp_resp.text or '')[:220]}", step="send_otp")
-
-        if otp_resp.status_code != 200:
-            emitter.error(f"验证码发送失败（状态码 {otp_resp.status_code}），跳过本轮", step="send_otp")
+        if signup_resp.status_code != 200:
+            emitter.error(f"注册表单提交失败（状态码 {signup_resp.status_code}）", step="signup")
+            emitter.error(str(signup_resp.text or "")[:220], step="signup")
             return None
 
         if _stopped():
             return None
 
-        # ------- 步骤7：轮询邮箱拿验证码 -------
+        # ------- 步骤6：设置密码并创建账号骨架 -------
+        emitter.info("正在设置账户密码...", step="set_password")
+        register_password = _generate_account_password()
+        register_resp = _session_post(
+            "https://auth.openai.com/api/accounts/user/register",
+            headers={
+                "referer": "https://auth.openai.com/create-account/password",
+                "accept": "application/json",
+                "content-type": "application/json",
+                "OpenAI-Sentinel-Token": sentinel,
+            },
+            data=json.dumps(
+                {"username": email, "password": register_password},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+        emitter.info(f"密码注册状态: {register_resp.status_code}", step="set_password")
+        if register_resp.status_code != 200:
+            emitter.error(f"密码注册失败（状态码 {register_resp.status_code}）", step="set_password")
+            emitter.error(str(register_resp.text or "")[:220], step="set_password")
+            return None
+
+        if _stopped():
+            return None
+
+        # ------- 步骤7：触发邮箱 OTP -------
+        emitter.info("正在发送邮箱验证码...", step="send_otp")
+        otp_send_resp = _session_get(
+            "https://auth.openai.com/api/accounts/email-otp/send",
+            headers={
+                "referer": "https://auth.openai.com/create-account/password",
+                "accept": "application/json",
+            },
+        )
+        emitter.info(f"验证码发送状态: {otp_send_resp.status_code}", step="send_otp")
+        if otp_send_resp.status_code != 200:
+            emitter.error(f"验证码发送失败（状态码 {otp_send_resp.status_code}）", step="send_otp")
+            emitter.error(str(otp_send_resp.text or "")[:220], step="send_otp")
+            return None
+
+        if _stopped():
+            return None
+
+        # ------- 步骤8：轮询邮箱拿验证码 -------
         if mail_provider is not None:
             try:
                 code = mail_provider.wait_for_otp(
@@ -1370,7 +1415,7 @@ def run(
         if _stopped():
             return None
 
-        # ------- 步骤8：提交验证码 -------
+        # ------- 步骤9：提交验证码 -------
         emitter.info("正在验证 OTP...", step="verify_otp")
         code_body = f'{{"code":"{code}"}}'
         code_resp = _session_post(
@@ -1383,11 +1428,15 @@ def run(
             data=code_body,
         )
         emitter.info(f"验证码校验状态: {code_resp.status_code}", step="verify_otp")
+        if code_resp.status_code != 200:
+            emitter.error(f"验证码校验失败（状态码 {code_resp.status_code}）", step="verify_otp")
+            emitter.error(str(code_resp.text or "")[:220], step="verify_otp")
+            return None
 
         if _stopped():
             return None
 
-        # ------- 步骤9：创建账户 -------
+        # ------- 步骤10：创建账户 -------
         emitter.info("正在创建账户信息...", step="create_account")
         create_account_body = '{"name":"Neo","birthdate":"2000-02-20"}'
         create_account_resp = _session_post(
@@ -1411,7 +1460,7 @@ def run(
         if _stopped():
             return None
 
-        # ------- 步骤10：解析 Workspace -------
+        # ------- 步骤11：解析 Workspace -------
         emitter.info("正在解析 Workspace 信息...", step="workspace")
         auth_cookie = s.cookies.get("oai-client-auth-session") or relay_cookie_jar.get("oai-client-auth-session") or ""
         if not auth_cookie:
@@ -1445,7 +1494,7 @@ def run(
 
         emitter.success(f"Workspace 选择成功: {workspace_id}", step="workspace")
 
-        # ------- 步骤11：跟踪重定向，获取 Token -------
+        # ------- 步骤12：跟踪重定向，获取 Token -------
         emitter.info("正在获取最终 OAuth Token...", step="get_token")
         continue_url = str((select_resp.json() or {}).get("continue_url") or "").strip()
         if not continue_url:
@@ -1606,4 +1655,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

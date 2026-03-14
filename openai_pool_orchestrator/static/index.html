@@ -262,8 +262,18 @@
             </div>
             <div style="display:flex;gap:6px;">
               <button id="poolCopyRtBtn" class="btn btn-ghost btn-sm">复制 RT</button>
+              <button id="tokenCheckBtn" class="btn btn-ghost btn-sm">校验本地</button>
+              <button id="tokenCleanupBtn" class="btn btn-danger btn-sm">清理异常</button>
+              <select id="poolBatchImportMode" class="token-filter-select">
+                <option value="sub2api_only">导入 Sub2Api</option>
+                <option value="cpa_only">导入 CPA</option>
+                <option value="parallel">双平台并行导入</option>
+              </select>
               <button id="poolPwSyncBtn" class="btn btn-primary btn-sm">批量导入</button>
             </div>
+          </div>
+          <div class="config-actions" style="margin-top:6px;margin-bottom:6px;">
+            <span id="tokenMaintainStatus" class="inline-status"></span>
           </div>
           <div class="token-filter-row">
             <select id="tokenFilterStatus" class="token-filter-select">
@@ -308,11 +318,12 @@
           <div class="config-field" style="max-width:720px;">
             <label>上传策略</label>
             <select id="uploadMode">
-              <option value="snapshot">串行补平台（先CPA后Sub2Api）</option>
-              <option value="decoupled">双平台同传（单账号双上传）</option>
+              <option value="cpa_only">仅上传 CPA</option>
+              <option value="sub2api_only">仅上传 Sub2Api</option>
+              <option value="parallel">双平台并行上传</option>
             </select>
             <div class="config-hint">
-              串行模式更保守；并行模式会让单账号并发上传到两个平台。当前任务运行中切换策略，将在下轮任务生效。
+              手动启动任务时按这里的策略上传。自动补号会按两个平台的实际缺口自动决定：只补少的平台，或两个一起补。运行中切换策略会在下轮任务生效。
             </div>
           </div>
           <div class="config-actions" style="margin-top:8px;">
@@ -584,6 +595,53 @@
         </div>
       </div>
 
+    </div>
+  </div>
+
+  <!-- 本地 Token 测试面板 -->
+  <div id="tokenTestModal" class="token-test-modal" hidden>
+    <div id="tokenTestBackdrop" class="token-test-backdrop"></div>
+    <div class="token-test-dialog" role="dialog" aria-modal="true" aria-labelledby="tokenTestTitle">
+      <div class="token-test-header">
+        <h3 id="tokenTestTitle">测试账号连接</h3>
+        <button id="tokenTestCloseBtn" class="token-test-close" type="button" aria-label="关闭">&times;</button>
+      </div>
+      <div class="token-test-body">
+        <div class="token-test-card">
+          <div class="token-test-card-icon">▶</div>
+          <div class="token-test-card-main">
+            <div id="tokenTestEmail" class="token-test-email">--</div>
+            <div class="token-test-tags">
+              <span class="token-test-tag">OAUTH</span>
+              <span class="token-test-tag">本地</span>
+            </div>
+          </div>
+          <span id="tokenTestStatusBadge" class="token-test-status idle">idle</span>
+        </div>
+
+        <div class="config-field">
+          <label for="tokenTestModelSelect">测试模型</label>
+          <select id="tokenTestModelSelect">
+            <option value="gpt-5-2">gpt-5.2</option>
+          </select>
+        </div>
+
+        <div class="config-field">
+          <label for="tokenTestPromptInput">提示词</label>
+          <input id="tokenTestPromptInput" type="text" value="hi" autocomplete="off" spellcheck="false" />
+        </div>
+
+        <div id="tokenTestLog" class="token-test-log"></div>
+
+        <div class="token-test-footer-meta">
+          <span id="tokenTestMetaLabel">测试模型</span>
+          <span id="tokenTestMetaHint">提示词: "hi"</span>
+        </div>
+      </div>
+      <div class="token-test-footer">
+        <button id="tokenTestCancelBtn" class="btn btn-ghost" type="button">关闭</button>
+        <button id="tokenTestRetryBtn" class="btn btn-success" type="button">开始测试</button>
+      </div>
     </div>
   </div>
 

@@ -4,6 +4,7 @@ FastAPI 后端服务
 """
 
 import asyncio
+import concurrent.futures
 import json
 import os
 import queue
@@ -24,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import __version__, TOKENS_DIR, CONFIG_FILE, STATE_FILE, STATIC_DIR, DATA_DIR
-from .register import EventEmitter, run, _fetch_proxy_from_pool
+from .register import EventEmitter, run, _fetch_proxy_from_pool, _post_form, _jwt_claims_no_verify, TOKEN_URL, CLIENT_ID
 from .mail_providers import create_provider, MultiMailRouter
 from .pool_maintainer import PoolMaintainer, Sub2ApiMaintainer
 
@@ -33,6 +34,29 @@ from .pool_maintainer import PoolMaintainer, Sub2ApiMaintainer
 # ==========================================
 
 # CONFIG_FILE 和 TOKENS_DIR 已从包 __init__.py 导入
+
+UPLOAD_MODE_CPA_ONLY = "cpa_only"
+UPLOAD_MODE_SUB2API_ONLY = "sub2api_only"
+UPLOAD_MODE_PARALLEL = "parallel"
+UPLOAD_MODES = (
+    UPLOAD_MODE_CPA_ONLY,
+    UPLOAD_MODE_SUB2API_ONLY,
+    UPLOAD_MODE_PARALLEL,
+)
+TOKEN_TEST_MODEL_FALLBACKS = [
+    "gpt-5.3",
+    "gpt-5",
+    "gpt-5-2",
+    "gpt-5-mini",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4o",
+    "gpt-4o-mini",
+]
+TOKEN_TEST_MODEL_ALIASES = {
+    "gpt-5.2": "gpt-5-2",
+    "gpt-5.3": "gpt-5-3",
+}
 
 
 def _load_sync_config() -> Dict[str, str]:
@@ -45,7 +69,7 @@ def _load_sync_config() -> Dict[str, str]:
         "base_url": "", "bearer_token": "", "account_name": "AutoReg", "auto_sync": "false",
         "cpa_base_url": "", "cpa_token": "", "min_candidates": 800,
         "used_percent_threshold": 95, "auto_maintain": False, "maintain_interval_minutes": 30,
-        "upload_mode": "snapshot",
+        "upload_mode": UPLOAD_MODE_PARALLEL,
         "mail_provider": "mailtm",
         "mail_config": {"api_base": "https://api.mail.tm", "api_key": "", "bearer_token": ""},
         "sub2api_min_candidates": 200,
@@ -88,14 +112,12 @@ def _normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if strategy not in ("round_robin", "random", "failover"):
         strategy = "round_robin"
 
+    cfg["auto_sync"] = "true" if _flag_enabled(cfg.get("auto_sync", "false")) else "false"
     cfg["mail_providers"] = providers
     cfg["mail_provider_configs"] = provider_cfgs
     cfg["mail_strategy"] = strategy
     cfg["mail_provider"] = providers[0]
-    upload_mode = str(cfg.get("upload_mode", "snapshot") or "snapshot").strip().lower()
-    if upload_mode not in ("snapshot", "decoupled"):
-        upload_mode = "snapshot"
-    cfg["upload_mode"] = upload_mode
+    cfg["upload_mode"] = _normalize_upload_mode(cfg.get("upload_mode", UPLOAD_MODE_PARALLEL))
     cfg.setdefault("multithread", False)
     try:
         cfg["thread_count"] = max(1, min(int(cfg.get("thread_count", 3)), 10))
@@ -139,7 +161,89 @@ def _save_sync_config(cfg: Dict[str, str]) -> None:
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _normalize_upload_mode(value: Any, default: str = UPLOAD_MODE_PARALLEL) -> str:
+    raw = str(value or "").strip().lower()
+    alias_map = {
+        "snapshot": UPLOAD_MODE_PARALLEL,
+        "decoupled": UPLOAD_MODE_PARALLEL,
+    }
+    normalized = alias_map.get(raw, raw)
+    if normalized not in UPLOAD_MODES:
+        return default
+    return normalized
+
+
+def _upload_mode_label(upload_mode: str) -> str:
+    mode = _normalize_upload_mode(upload_mode)
+    if mode == UPLOAD_MODE_CPA_ONLY:
+        return "仅上传 CPA"
+    if mode == UPLOAD_MODE_SUB2API_ONLY:
+        return "仅上传 Sub2Api"
+    return "双平台并行上传"
+
+
+def _flag_enabled(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _secret_preview(value: Any, preview_len: int = 8) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    return f"{text[:preview_len]}..." if len(text) > preview_len else text
+
+
+def _mask_secret_dict(
+    raw: Any,
+    secret_keys: tuple[str, ...],
+    preview_lengths: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    safe = dict(raw)
+    preview_lengths = preview_lengths or {}
+    for secret_key in secret_keys:
+        val = str(safe.get(secret_key, "") or "")
+        safe[f"{secret_key}_preview"] = _secret_preview(val, preview_lengths.get(secret_key, 8))
+        safe.pop(secret_key, None)
+    return safe
+
+
 _sync_config = _normalize_config(_load_sync_config())
+_sub2api_auth_lock = threading.Lock()
+
+
+def _refresh_sub2api_bearer(base_url: str) -> str:
+    login_base_url = str(base_url or _sync_config.get("base_url") or "").strip()
+    login_email = str(_sync_config.get("email") or "").strip()
+    login_password = str(_sync_config.get("password") or "").strip()
+    if not login_base_url or not login_email or not login_password:
+        return ""
+
+    with _sub2api_auth_lock:
+        current_token = str(_sync_config.get("bearer_token") or "").strip()
+        verify = _verify_sub2api_login(login_base_url, login_email, login_password)
+        if not verify.get("ok"):
+            return ""
+        token = str(verify.get("token") or current_token).strip()
+        if token:
+            _sync_config["base_url"] = login_base_url
+            _sync_config["bearer_token"] = token
+            _save_sync_config(_sync_config)
+        return token
 
 
 def _push_refresh_token(base_url: str, bearer: str, refresh_token: str) -> Dict[str, Any]:
@@ -149,25 +253,33 @@ def _push_refresh_token(base_url: str, bearer: str, refresh_token: str) -> Dict[
     """
     url = base_url.rstrip("/") + "/api/v1/admin/openai/refresh-token"
     payload = json.dumps({"refresh_token": refresh_token}).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {bearer}",
-            "Accept": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            body = resp.read().decode("utf-8", "replace")
-            return {"ok": True, "status": resp.status, "body": body}
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", "replace")
-        return {"ok": False, "status": exc.code, "body": body}
-    except Exception as e:
-        return {"ok": False, "status": 0, "body": str(e)}
+    def _send_request(auth_bearer: str) -> Dict[str, Any]:
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {auth_bearer}",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = resp.read().decode("utf-8", "replace")
+                return {"ok": True, "status": resp.status, "body": body}
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")
+            return {"ok": False, "status": exc.code, "body": body}
+        except Exception as e:
+            return {"ok": False, "status": 0, "body": str(e)}
+
+    result = _send_request(bearer)
+    if result["status"] == 401:
+        refreshed_bearer = _refresh_sub2api_bearer(base_url)
+        if refreshed_bearer and refreshed_bearer != bearer:
+            result = _send_request(refreshed_bearer)
+    return result
 
 
 UPLOAD_PLATFORMS = ("cpa", "sub2api")
@@ -285,7 +397,7 @@ class TaskState:
         self.current_proxy: str = ""
         self.worker_count: int = 0
         self.multithread: bool = False
-        self.upload_mode: str = "snapshot"
+        self.upload_mode: str = UPLOAD_MODE_PARALLEL
         self.target_count: int = 0
         # 当前任务内计数（与历史累计 success/fail 分离）
         self.run_success_count: int = 0
@@ -356,12 +468,11 @@ class TaskState:
         target_count: int = 0,
         cpa_target_count: Optional[int] = None,
         sub2api_target_count: Optional[int] = None,
+        upload_mode_override: Optional[str] = None,
     ) -> None:
         cpa_target = None if cpa_target_count is None else max(0, int(cpa_target_count))
         sub2api_target = None if sub2api_target_count is None else max(0, int(sub2api_target_count))
-        upload_mode = str(_sync_config.get("upload_mode", "snapshot") or "snapshot").strip().lower()
-        if upload_mode not in ("snapshot", "decoupled"):
-            upload_mode = "snapshot"
+        upload_mode = _normalize_upload_mode(upload_mode_override or _sync_config.get("upload_mode", UPLOAD_MODE_PARALLEL))
 
         with self._task_lock:
             if self.status in ("running", "stopping"):
@@ -383,23 +494,27 @@ class TaskState:
             self._worker_threads = {}
 
         emitter = self._make_emitter()
-        emitter.info(
-            f"上传策略: {'串行补平台（先CPA后Sub2Api）' if upload_mode == 'snapshot' else '双平台同传（单账号双上传）'}",
-            step="mode",
-        )
+        emitter.info(f"上传策略: {_upload_mode_label(upload_mode)}", step="mode")
 
         mail_router = MultiMailRouter(_sync_config)
         pool_maintainer = _get_pool_maintainer()
-        auto_sync_enabled = _sync_config.get("auto_sync", "true") == "true"
+        auto_sync_enabled = _flag_enabled(_sync_config.get("auto_sync", "false"))
+        selected_platforms: set[str] = set()
+        if upload_mode == UPLOAD_MODE_CPA_ONLY:
+            if pool_maintainer:
+                selected_platforms.add("cpa")
+        elif upload_mode == UPLOAD_MODE_SUB2API_ONLY:
+            if auto_sync_enabled:
+                selected_platforms.add("sub2api")
+        else:
+            if pool_maintainer:
+                selected_platforms.add("cpa")
+            if auto_sync_enabled:
+                selected_platforms.add("sub2api")
         upload_remaining: Dict[str, Optional[int]] = {
             "cpa": cpa_target,
             "sub2api": sub2api_target,
         }
-        snapshot_strict_serial = (
-            upload_mode == "snapshot"
-            and cpa_target is not None
-            and sub2api_target is not None
-        )
         token_states: Dict[str, Dict[str, Any]] = {}
         token_states_lock = threading.RLock()
         upload_queues: Dict[str, queue.Queue] = {}
@@ -422,9 +537,9 @@ class TaskState:
                 if remain is not None:
                     upload_remaining[platform] = remain + 1
 
-        def _decoupled_slots_exhausted() -> bool:
-            """仅在双平台同传 + 有限配额场景下判断是否已无可用上传槽位。"""
-            if upload_mode != "decoupled":
+        def _parallel_slots_exhausted() -> bool:
+            """仅在双平台并行 + 有限配额场景下判断是否已无可用上传槽位。"""
+            if upload_mode != UPLOAD_MODE_PARALLEL:
                 return False
             with self._task_lock:
                 finite_remains = [
@@ -433,18 +548,6 @@ class TaskState:
                     if remain is not None
                 ]
             return bool(finite_remains) and all(remain <= 0 for remain in finite_remains)
-
-        def _reserve_snapshot_serial_platform() -> Optional[str]:
-            with self._task_lock:
-                cpa_remain = upload_remaining.get("cpa")
-                if cpa_remain is not None and cpa_remain > 0:
-                    upload_remaining["cpa"] = cpa_remain - 1
-                    return "cpa"
-                sub2api_remain = upload_remaining.get("sub2api")
-                if sub2api_remain is not None and sub2api_remain > 0:
-                    upload_remaining["sub2api"] = sub2api_remain - 1
-                    return "sub2api"
-            return None
 
         def _record_platform_result(platform: str, ok: bool) -> None:
             if platform not in UPLOAD_PLATFORMS:
@@ -457,7 +560,7 @@ class TaskState:
 
         def _refresh_backlog() -> None:
             with self._task_lock:
-                if upload_mode != "decoupled":
+                if upload_mode != UPLOAD_MODE_PARALLEL:
                     self.platform_backlog_count = {name: 0 for name in UPLOAD_PLATFORMS}
                     return
                 self.platform_backlog_count = {
@@ -487,7 +590,7 @@ class TaskState:
 
         def _auto_sync(file_name: str, email: str, em: "EventEmitter") -> bool:
             cfg = _sync_config
-            if cfg.get("auto_sync", "true") != "true":
+            if not _flag_enabled(cfg.get("auto_sync", "false")):
                 return True
             base_url = cfg.get("base_url", "").strip()
             bearer = cfg.get("bearer_token", "").strip()
@@ -508,7 +611,7 @@ class TaskState:
             last_body = ""
             for attempt in range(3):
                 try:
-                    result = _push_account_api(base_url, bearer, email, token_data)
+                    result = _push_sub2api_token(base_url, bearer, email, token_data)
                     last_status = int(result.get("status") or 0)
                     last_body = str(result.get("body") or "")
                     if result.get("ok"):
@@ -582,7 +685,7 @@ class TaskState:
                 return
             if no_required_platforms:
                 # 有限配额耗尽后，后续注册不应继续计入成功。
-                if _decoupled_slots_exhausted():
+                if _parallel_slots_exhausted():
                     emitter.info(
                         f"{prefix}平台目标已满足，跳过本次上传且不计成功: {email}",
                         step="auto_stop",
@@ -670,7 +773,7 @@ class TaskState:
             prefix = f"[W{worker_id}] " if n > 1 else ""
             count = 0
             while not self.stop_event.is_set():
-                if _decoupled_slots_exhausted():
+                if _parallel_slots_exhausted():
                     emitter.info(f"{prefix}双平台目标已满足，停止新增注册", step="auto_stop")
                     self.stop_event.set()
                     break
@@ -725,63 +828,17 @@ class TaskState:
                             "step": "saved",
                         })
 
-                        if upload_mode == "snapshot":
-                            if snapshot_strict_serial:
-                                selected_platform = _reserve_snapshot_serial_platform()
-                                if selected_platform == "cpa":
-                                    emitter.info(f"{prefix}串行模式：本次仅上传 CPA -> {email}", step="cpa_upload")
-                                    cpa_ok = _upload_to_cpa(file_name, file_path, token_json, email, prefix) if pool_maintainer else True
-                                    _record_platform_result("cpa", cpa_ok)
-                                    if not cpa_ok:
-                                        _release_upload_slot("cpa")
-                                    _apply_final_result(email, prefix, cpa_ok)
-                                elif selected_platform == "sub2api":
-                                    emitter.info(f"{prefix}串行模式：本次仅上传 Sub2Api -> {email}", step="sync")
-                                    sub2api_ok = _upload_to_sub2api(file_name, email, refresh_token, prefix) if auto_sync_enabled else True
-                                    _record_platform_result("sub2api", sub2api_ok)
-                                    if not sub2api_ok:
-                                        _release_upload_slot("sub2api")
-                                    _apply_final_result(email, prefix, sub2api_ok)
-                                else:
-                                    emitter.info(f"{prefix}串行模式目标已满足，停止新增上传: {email}", step="auto_stop")
-                                    self.stop_event.set()
-                            else:
-                                cpa_ok = True
-                                cpa_required = False
-                                if pool_maintainer:
-                                    cpa_required = _reserve_upload_slot("cpa")
-                                if pool_maintainer and not cpa_required:
-                                    emitter.info(f"{prefix}CPA 已达目标阈值，跳过上传: {email}", step="cpa_upload")
-                                if pool_maintainer and cpa_required:
-                                    cpa_ok = _upload_to_cpa(file_name, file_path, token_json, email, prefix)
-                                    _record_platform_result("cpa", cpa_ok)
-                                    if not cpa_ok:
-                                        _release_upload_slot("cpa")
-
-                                sub2api_ok = True
-                                sub2api_required = False
-                                if auto_sync_enabled:
-                                    sub2api_required = _reserve_upload_slot("sub2api")
-                                if auto_sync_enabled and not sub2api_required:
-                                    emitter.info(f"{prefix}Sub2Api 已达目标阈值，跳过同步: {email}", step="sync")
-                                if auto_sync_enabled and sub2api_required:
-                                    sub2api_ok = _upload_to_sub2api(file_name, email, refresh_token, prefix)
-                                    _record_platform_result("sub2api", sub2api_ok)
-                                    if not sub2api_ok:
-                                        _release_upload_slot("sub2api")
-
-                                _apply_final_result(email, prefix, cpa_ok and sub2api_ok)
-                        else:
+                        if upload_mode == UPLOAD_MODE_PARALLEL:
                             required_platforms: set[str] = set()
                             failed_platforms: set[str] = set()
 
-                            if pool_maintainer:
+                            if "cpa" in selected_platforms:
                                 if _reserve_upload_slot("cpa"):
                                     required_platforms.add("cpa")
                                 else:
                                     emitter.info(f"{prefix}CPA 已达目标阈值，跳过上传: {email}", step="cpa_upload")
 
-                            if auto_sync_enabled:
+                            if "sub2api" in selected_platforms:
                                 if _reserve_upload_slot("sub2api"):
                                     if refresh_token:
                                         required_platforms.add("sub2api")
@@ -808,6 +865,29 @@ class TaskState:
                                 _enqueue_upload_job("cpa", base_job, prefix)
                             if "sub2api" in required_platforms:
                                 _enqueue_upload_job("sub2api", base_job, prefix)
+                        else:
+                            if not selected_platforms:
+                                emitter.warn(f"{prefix}当前策略未启用可上传平台，仅保存本地 Token: {email}", step="saved")
+                                _apply_final_result(email, prefix, True)
+                                continue
+
+                            selected_platform = "cpa" if upload_mode == UPLOAD_MODE_CPA_ONLY else "sub2api"
+                            if not _reserve_upload_slot(selected_platform):
+                                emitter.info(f"{prefix}{selected_platform.upper()} 已达目标阈值，停止新增上传: {email}", step="auto_stop")
+                                self.stop_event.set()
+                                continue
+
+                            if selected_platform == "cpa":
+                                emitter.info(f"{prefix}单平台模式：仅上传 CPA -> {email}", step="cpa_upload")
+                                platform_ok = _upload_to_cpa(file_name, file_path, token_json, email, prefix)
+                            else:
+                                emitter.info(f"{prefix}单平台模式：仅上传 Sub2Api -> {email}", step="sync")
+                                platform_ok = _upload_to_sub2api(file_name, email, refresh_token, prefix)
+
+                            _record_platform_result(selected_platform, platform_ok)
+                            if not platform_ok:
+                                _release_upload_slot(selected_platform)
+                            _apply_final_result(email, prefix, platform_ok)
                     else:
                         mail_router.report_failure(provider_name)
                         with self._task_lock:
@@ -831,15 +911,15 @@ class TaskState:
                 emitter.info(f"{prefix}休息 {wait} 秒后继续...", step="wait")
                 self.stop_event.wait(wait)
 
-        if upload_mode == "decoupled":
+        if upload_mode == UPLOAD_MODE_PARALLEL:
             upload_queues = {
                 platform: queue.Queue(maxsize=2000)
-                for platform in UPLOAD_PLATFORMS
+                for platform in selected_platforms
             }
             with self._task_lock:
                 self._upload_queues = upload_queues
             _refresh_backlog()
-            for platform in UPLOAD_PLATFORMS:
+            for platform in selected_platforms:
                 t = threading.Thread(target=_upload_worker_loop, args=(platform,), daemon=True)
                 upload_workers[platform] = t
                 t.start()
@@ -849,7 +929,7 @@ class TaskState:
                 workers = list(self._worker_threads.values())
             for t in workers:
                 t.join()
-            if upload_mode == "decoupled":
+            if upload_mode == UPLOAD_MODE_PARALLEL:
                 producers_done.set()
                 for ut in upload_workers.values():
                     ut.join()
@@ -973,7 +1053,7 @@ class SyncConfigRequest(BaseModel):
     password: str = ""     # 管理员密码
     account_name: str = "AutoReg"
     auto_sync: str = "true"  # "true" | "false"
-    upload_mode: str = "snapshot"  # "snapshot" | "decoupled"
+    upload_mode: str = UPLOAD_MODE_PARALLEL  # cpa_only | sub2api_only | parallel
     sub2api_min_candidates: int = 200
     sub2api_auto_maintain: bool = False
     sub2api_maintain_interval_minutes: int = 30
@@ -987,14 +1067,43 @@ class SyncNowRequest(BaseModel):
 
 
 class UploadModeRequest(BaseModel):
-    upload_mode: str = "snapshot"  # "snapshot" | "decoupled"
+    upload_mode: str = UPLOAD_MODE_PARALLEL  # cpa_only | sub2api_only | parallel
+
+
+class TokenMaintainRequest(BaseModel):
+    filenames: List[str] = []  # 空列表 = 检查全部
+    delete_invalid: bool = False
+
+
+class TokenTestRequest(BaseModel):
+    filename: str
+    model: str = "gpt-5-2"
+    prompt: str = "hi"
+
+
+class TokenModelsRequest(BaseModel):
+    filename: str
 
 
 @app.get("/", response_class=HTMLResponse)
 async def index() -> HTMLResponse:
     html_path = STATIC_DIR / "index.html"
     if html_path.exists():
-        return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+        html = html_path.read_text(encoding="utf-8")
+        try:
+            style_version = int((STATIC_DIR / "style.css").stat().st_mtime_ns)
+            app_version = int((STATIC_DIR / "app.js").stat().st_mtime_ns)
+        except Exception:
+            style_version = app_version = int(time.time() * 1_000_000_000)
+        html = html.replace("/static/style.css", f"/static/style.css?v={style_version}")
+        html = html.replace("/static/app.js", f"/static/app.js?v={app_version}")
+        return HTMLResponse(
+            content=html,
+            headers={
+                "Cache-Control": "no-store",
+                "Pragma": "no-cache",
+            },
+        )
     return HTMLResponse("<h1>前端文件未找到</h1>", status_code=404)
 
 
@@ -1095,10 +1204,26 @@ async def api_delete_token(filename: str) -> Dict[str, str]:
     return {"status": "deleted"}
 
 
+@app.post("/api/tokens/maintain")
+async def api_maintain_tokens(req: TokenMaintainRequest) -> Dict[str, Any]:
+    return await run_in_threadpool(_maintain_local_tokens, req.filenames, req.delete_invalid)
+
+
+@app.post("/api/tokens/test")
+async def api_test_token(req: TokenTestRequest) -> Dict[str, Any]:
+    return await run_in_threadpool(_test_local_token_connection, req.filename, req.model, req.prompt)
+
+
+@app.post("/api/tokens/test-models")
+async def api_test_token_models(req: TokenModelsRequest) -> Dict[str, Any]:
+    return await run_in_threadpool(_fetch_local_token_models, req.filename)
+
+
 @app.get("/api/sync-config")
 async def api_get_sync_config() -> Dict[str, Any]:
     """获取当前同步配置（脱敏）"""
     cfg = dict(_sync_config)
+    cfg["auto_sync"] = "true" if _flag_enabled(cfg.get("auto_sync", "false")) else "false"
     cfg["password"] = ""  # 不回传密码
     token = cfg.get("bearer_token", "")
     cfg["bearer_token_preview"] = token[:12] + "..." if len(token) > 12 else (token or "")
@@ -1112,24 +1237,25 @@ async def api_get_sync_config() -> Dict[str, Any]:
         (proxy_pool_api_key[:8] + "...") if len(proxy_pool_api_key) > 8 else (proxy_pool_api_key or "")
     )
     cfg["proxy_pool_api_key"] = ""
+    cfg["mail_config"] = _mask_secret_dict(
+        cfg.get("mail_config") or {},
+        secret_keys=("bearer_token", "api_key", "admin_password"),
+        preview_lengths={"bearer_token": 12, "api_key": 8, "admin_password": 8},
+    )
     # 脱敏 mail_provider_configs
     raw_configs = cfg.get("mail_provider_configs") or {}
     safe_configs: Dict[str, Dict] = {}
     for pname, pcfg in raw_configs.items():
-        if not isinstance(pcfg, dict):
-            continue
-        sc = dict(pcfg)
-        for secret_key in ("bearer_token", "api_key", "admin_password"):
-            val = str(sc.get(secret_key, ""))
-            if val:
-                sc[f"{secret_key}_preview"] = (val[:8] + "...") if len(val) > 8 else val
-                sc.pop(secret_key, None)
-        safe_configs[pname] = sc
+        safe_configs[pname] = _mask_secret_dict(
+            pcfg,
+            secret_keys=("bearer_token", "api_key", "admin_password"),
+            preview_lengths={"bearer_token": 12, "api_key": 8, "admin_password": 8},
+        )
     cfg["mail_provider_configs"] = safe_configs
     cfg.setdefault("sub2api_min_candidates", 200)
     cfg.setdefault("sub2api_auto_maintain", False)
     cfg.setdefault("sub2api_maintain_interval_minutes", 30)
-    cfg.setdefault("upload_mode", "snapshot")
+    cfg.setdefault("upload_mode", UPLOAD_MODE_PARALLEL)
     cfg.setdefault("multithread", False)
     cfg.setdefault("thread_count", 3)
     cfg.setdefault("proxy_pool_enabled", True)
@@ -1199,9 +1325,10 @@ async def api_set_proxy_pool_config(req: ProxyPoolConfigRequest) -> Dict[str, An
 
 @app.post("/api/upload-mode")
 async def api_set_upload_mode(req: UploadModeRequest) -> Dict[str, Any]:
-    upload_mode = str(req.upload_mode or "snapshot").strip().lower()
-    if upload_mode not in ("snapshot", "decoupled"):
-        raise HTTPException(status_code=400, detail="upload_mode 仅支持 snapshot / decoupled")
+    raw_upload_mode = str(req.upload_mode or "").strip().lower()
+    if raw_upload_mode not in (*UPLOAD_MODES, "snapshot", "decoupled"):
+        raise HTTPException(status_code=400, detail="upload_mode 仅支持 cpa_only / sub2api_only / parallel")
+    upload_mode = _normalize_upload_mode(raw_upload_mode)
     _sync_config["upload_mode"] = upload_mode
     _save_sync_config(_sync_config)
     # 空闲状态下同步到内存状态，便于前端立即看到当前策略
@@ -1273,9 +1400,7 @@ async def api_set_sync_config(req: SyncConfigRequest) -> Dict[str, Any]:
     if not verify["ok"]:
         raise HTTPException(status_code=400, detail=verify["error"])
 
-    upload_mode = str(req.upload_mode or "snapshot").strip().lower()
-    if upload_mode not in ("snapshot", "decoupled"):
-        upload_mode = "snapshot"
+    upload_mode = _normalize_upload_mode(req.upload_mode)
 
     _sync_config.update({
         "base_url": new_base_url,
@@ -1283,7 +1408,7 @@ async def api_set_sync_config(req: SyncConfigRequest) -> Dict[str, Any]:
         "email": new_email,
         "password": new_password,
         "account_name": req.account_name.strip(),
-        "auto_sync": req.auto_sync,
+        "auto_sync": "true" if _flag_enabled(req.auto_sync, False) else "false",
         "upload_mode": upload_mode,
         "sub2api_min_candidates": max(1, req.sub2api_min_candidates),
         "sub2api_auto_maintain": req.sub2api_auto_maintain,
@@ -1612,6 +1737,11 @@ class BatchSyncRequest(BaseModel):
     filenames: List[str] = []  # 空列表 = 同步全部
 
 
+class BatchImportRequest(BaseModel):
+    filenames: List[str] = []  # 空列表 = 导入全部
+    mode: str = UPLOAD_MODE_PARALLEL
+
+
 def _decode_jwt_payload(token: str) -> Dict[str, Any]:
     """解析 JWT payload（不验签）"""
     try:
@@ -1680,22 +1810,670 @@ def _push_account_api(base_url: str, bearer: str, email: str, token_data: Dict[s
     from curl_cffi import requests as cffi_req
     url = base_url.rstrip("/") + "/api/v1/admin/accounts"
     payload = _build_account_payload(email, token_data)
+    def _send_request(auth_bearer: str) -> Dict[str, Any]:
+        try:
+            resp = cffi_req.post(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {auth_bearer}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/plain, */*",
+                    "Referer": base_url.rstrip("/") + "/admin/accounts",
+                },
+                impersonate="chrome",
+                timeout=20,
+            )
+            return {"ok": resp.status_code in (200, 201), "status": resp.status_code, "body": resp.text[:300]}
+        except Exception as e:
+            return {"ok": False, "status": 0, "body": str(e)}
+
+    result = _send_request(bearer)
+    if result["status"] == 401:
+        refreshed_bearer = _refresh_sub2api_bearer(base_url)
+        if refreshed_bearer and refreshed_bearer != bearer:
+            result = _send_request(refreshed_bearer)
+    return result
+
+
+def _push_sub2api_token(base_url: str, bearer: str, email: str, token_data: Dict[str, Any]) -> Dict[str, Any]:
+    account_result = _push_account_api(base_url, bearer, email, token_data)
+    if account_result.get("ok"):
+        account_result["mode"] = "account"
+        return account_result
+
+    refresh_token = str(token_data.get("refresh_token") or "").strip()
+    if not refresh_token:
+        account_result["mode"] = "account"
+        return account_result
+
+    body_lower = str(account_result.get("body") or "").lower()
+    should_fallback = (
+        int(account_result.get("status") or 0) in (400, 401, 500, 502, 503)
+        or "token_expired" in body_lower
+        or "internal error" in body_lower
+    )
+    if not should_fallback:
+        account_result["mode"] = "account"
+        return account_result
+
+    refresh_result = _push_refresh_token(base_url, bearer, refresh_token)
+    refresh_result["mode"] = "refresh_token"
+    if refresh_result.get("ok"):
+        refresh_result["fallback_from_status"] = account_result.get("status", 0)
+    return refresh_result if refresh_result.get("ok") else account_result
+
+
+def _load_batch_import_targets(filenames: List[str]) -> List[str]:
+    target_filenames = filenames or []
+    if not target_filenames and os.path.isdir(TOKENS_DIR):
+        target_filenames = [f for f in os.listdir(TOKENS_DIR) if f.endswith(".json")]
+    return [fname for fname in target_filenames if isinstance(fname, str)]
+
+
+def _local_token_proxy() -> str:
+    return str(_state.current_proxy or _sync_config.get("proxy", "") or "").strip()
+
+
+def _probe_local_access_token(token_data: Dict[str, Any], proxy: str = "") -> Dict[str, Any]:
+    import requests as _requests
+
+    access_token = str(token_data.get("access_token") or "").strip()
+    if not access_token:
+        return {"ok": False, "invalid": False, "reason": "missing_access_token"}
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+    }
+    account_id = str(token_data.get("account_id") or "").strip()
+    if not account_id:
+        auth_claims = _decode_jwt_payload(access_token).get("https://api.openai.com/auth") or {}
+        account_id = str(auth_claims.get("chatgpt_account_id") or "").strip()
+    if account_id:
+        headers["Chatgpt-Account-Id"] = account_id
+
     try:
-        resp = cffi_req.post(
-            url,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {bearer}",
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/plain, */*",
-                "Referer": base_url.rstrip("/") + "/admin/accounts",
+        session = _requests.Session()
+        if proxy:
+            session.proxies = {"http": proxy, "https": proxy}
+        resp = session.get(
+            "https://chatgpt.com/backend-api/wham/usage",
+            headers=headers,
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            return {"ok": True, "invalid": False, "reason": ""}
+        if resp.status_code == 401:
+            return {"ok": False, "invalid": True, "reason": "http_401"}
+        return {"ok": False, "invalid": False, "reason": f"http_{resp.status_code}"}
+    except Exception as e:
+        return {"ok": False, "invalid": False, "reason": str(e)}
+
+
+def _refresh_local_token_data(token_data: Dict[str, Any], proxy: str = "") -> Dict[str, Any]:
+    refresh_token = str(token_data.get("refresh_token") or "").strip()
+    if not refresh_token:
+        return {"ok": False, "invalid": False, "reason": "missing_refresh_token"}
+
+    try:
+        token_resp = _post_form(
+            TOKEN_URL,
+            {
+                "grant_type": "refresh_token",
+                "client_id": CLIENT_ID,
+                "refresh_token": refresh_token,
             },
-            impersonate="chrome",
+            proxy=proxy,
+        )
+        access_token = str(token_resp.get("access_token") or "").strip()
+        next_refresh_token = str(token_resp.get("refresh_token") or refresh_token).strip()
+        id_token = str(token_resp.get("id_token") or token_data.get("id_token") or "").strip()
+        expires_in = int(token_resp.get("expires_in") or 0)
+        claims = _jwt_claims_no_verify(id_token) if id_token else {}
+        auth_claims = claims.get("https://api.openai.com/auth") or {}
+        account_id = str(
+            auth_claims.get("chatgpt_account_id")
+            or token_data.get("account_id")
+            or ""
+        ).strip()
+        email = str(claims.get("email") or token_data.get("email") or "").strip()
+        expired_rfc3339 = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(int(time.time()) + max(expires_in, 0)),
+        )
+        updated = dict(token_data)
+        updated.update({
+            "access_token": access_token,
+            "refresh_token": next_refresh_token,
+            "id_token": id_token,
+            "account_id": account_id,
+            "email": email or token_data.get("email", ""),
+            "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "expired": expired_rfc3339,
+        })
+        return {"ok": True, "invalid": False, "reason": "", "token_data": updated}
+    except Exception as e:
+        reason = str(e)
+        lower_reason = reason.lower()
+        invalid = any(flag in lower_reason for flag in ("invalid_grant", "invalid_request", "unauthorized", "401"))
+        return {"ok": False, "invalid": invalid, "reason": reason}
+
+
+def _validate_local_token_data(token_data: Dict[str, Any], proxy: str = "") -> Dict[str, Any]:
+    access_result = _probe_local_access_token(token_data, proxy)
+    if access_result.get("ok"):
+        return {"ok": True, "invalid": False, "reason": "", "updated": False, "token_data": token_data}
+
+    if token_data.get("refresh_token"):
+        refresh_result = _refresh_local_token_data(token_data, proxy)
+        if refresh_result.get("ok"):
+            refreshed_token_data = refresh_result.get("token_data") or token_data
+            reprobe_result = _probe_local_access_token(refreshed_token_data, proxy)
+            if reprobe_result.get("ok"):
+                return {
+                    "ok": True,
+                    "invalid": False,
+                    "reason": "",
+                    "updated": True,
+                    "token_data": refreshed_token_data,
+                }
+            if reprobe_result.get("invalid"):
+                return {
+                    "ok": False,
+                    "invalid": True,
+                    "reason": reprobe_result.get("reason", "refreshed_access_invalid"),
+                }
+            return {
+                "ok": False,
+                "invalid": False,
+                "reason": reprobe_result.get("reason", "refreshed_probe_failed"),
+            }
+        if refresh_result.get("invalid"):
+            return {"ok": False, "invalid": True, "reason": refresh_result.get("reason", "refresh_failed")}
+
+    if access_result.get("invalid"):
+        return {"ok": False, "invalid": True, "reason": access_result.get("reason", "access_invalid")}
+    return {"ok": False, "invalid": False, "reason": access_result.get("reason", "probe_failed")}
+
+
+def _maintain_local_tokens(filenames: Optional[List[str]] = None, delete_invalid: bool = False) -> Dict[str, Any]:
+    proxy = _local_token_proxy()
+    requested = filenames or []
+    target_files: List[str]
+    if requested:
+        target_files = [name for name in requested if name.endswith(".json")]
+    else:
+        target_files = [f for f in os.listdir(TOKENS_DIR) if f.endswith(".json")] if os.path.isdir(TOKENS_DIR) else []
+
+    def _process_one(fname: str) -> Dict[str, Any]:
+        if "/" in fname or "\\" in fname or ".." in fname:
+            return {"file": fname, "ok": False, "invalid": False, "error": "非法文件名", "deleted": False, "updated": False}
+        fpath = os.path.join(TOKENS_DIR, fname)
+        if not os.path.isfile(fpath):
+            return {"file": fname, "ok": False, "invalid": False, "error": "文件不存在", "deleted": False, "updated": False}
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                token_data = json.load(f)
+        except Exception as e:
+            if delete_invalid:
+                try:
+                    os.remove(fpath)
+                    return {"file": fname, "ok": False, "invalid": True, "error": f"文件损坏: {e}", "deleted": True, "updated": False}
+                except Exception as delete_error:
+                    return {"file": fname, "ok": False, "invalid": True, "error": f"文件损坏且删除失败: {delete_error}", "deleted": False, "updated": False}
+            return {"file": fname, "ok": False, "invalid": True, "error": f"文件损坏: {e}", "deleted": False, "updated": False}
+
+        if not isinstance(token_data, dict):
+            if delete_invalid:
+                try:
+                    os.remove(fpath)
+                    return {"file": fname, "ok": False, "invalid": True, "error": "文件内容不是对象", "deleted": True, "updated": False}
+                except Exception as delete_error:
+                    return {"file": fname, "ok": False, "invalid": True, "error": f"文件内容不是对象且删除失败: {delete_error}", "deleted": False, "updated": False}
+            return {"file": fname, "ok": False, "invalid": True, "error": "文件内容不是对象", "deleted": False, "updated": False}
+
+        result = _validate_local_token_data(token_data, proxy)
+        if result.get("ok"):
+            updated = bool(result.get("updated"))
+            if updated:
+                with open(fpath, "w", encoding="utf-8") as f:
+                    json.dump(result.get("token_data") or token_data, f, ensure_ascii=False)
+            return {
+                "file": fname,
+                "ok": True,
+                "invalid": False,
+                "error": "",
+                "deleted": False,
+                "updated": updated,
+            }
+
+        invalid = bool(result.get("invalid"))
+        if invalid and delete_invalid:
+            try:
+                os.remove(fpath)
+                return {"file": fname, "ok": False, "invalid": True, "error": result.get("reason", "invalid"), "deleted": True, "updated": False}
+            except Exception as delete_error:
+                return {"file": fname, "ok": False, "invalid": True, "error": f"{result.get('reason', 'invalid')}，删除失败: {delete_error}", "deleted": False, "updated": False}
+        return {"file": fname, "ok": False, "invalid": invalid, "error": result.get("reason", "unknown"), "deleted": False, "updated": False}
+
+    results: List[Dict[str, Any]] = []
+    max_workers = max(1, min(48, len(target_files) or 1))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = [executor.submit(_process_one, fname) for fname in target_files]
+        for future in concurrent.futures.as_completed(future_map):
+            results.append(future.result())
+
+    results.sort(key=lambda item: item.get("file", ""))
+    valid_count = sum(1 for item in results if item.get("ok"))
+    invalid_count = sum(1 for item in results if item.get("invalid"))
+    deleted_count = sum(1 for item in results if item.get("deleted"))
+    updated_count = sum(1 for item in results if item.get("updated"))
+    probe_error_count = sum(1 for item in results if not item.get("ok") and not item.get("invalid"))
+    return {
+        "total": len(results),
+        "valid": valid_count,
+        "invalid": invalid_count,
+        "deleted": deleted_count,
+        "updated": updated_count,
+        "probe_errors": probe_error_count,
+        "results": results,
+    }
+
+
+def _extract_responses_output_text(payload: Dict[str, Any]) -> str:
+    direct = str(payload.get("output_text") or "").strip()
+    if direct:
+        return direct
+
+    chunks: List[str] = []
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content") or []:
+            if not isinstance(content, dict):
+                continue
+            text = content.get("text")
+            if isinstance(text, str) and text.strip():
+                chunks.append(text.strip())
+            elif isinstance(text, dict):
+                value = str(text.get("value") or "").strip()
+                if value:
+                    chunks.append(value)
+    return "\n".join(chunks).strip()
+
+
+def _load_local_token_data(filename: str) -> Dict[str, Any]:
+    safe_filename = str(filename or "").strip()
+    if "/" in safe_filename or "\\" in safe_filename or ".." in safe_filename:
+        raise HTTPException(status_code=400, detail="非法文件名")
+    fpath = os.path.join(TOKENS_DIR, safe_filename)
+    if not os.path.isfile(fpath):
+        raise HTTPException(status_code=404, detail="文件不存在")
+    with open(fpath, "r", encoding="utf-8") as f:
+        token_data = json.load(f)
+    if not isinstance(token_data, dict):
+        raise HTTPException(status_code=400, detail="Token 文件内容无效")
+    return token_data
+
+
+def _sort_token_test_models(model_ids: List[str]) -> List[str]:
+    seen = set()
+    unique_models: List[str] = []
+    for model_id in model_ids:
+        name = str(model_id or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        unique_models.append(name)
+
+    preferred_order = {name: idx for idx, name in enumerate(TOKEN_TEST_MODEL_FALLBACKS)}
+    return sorted(
+        unique_models,
+        key=lambda name: (
+            0 if name in preferred_order else 1,
+            preferred_order.get(name, 9999),
+            name,
+        ),
+    )
+
+
+def _normalize_token_test_model(model: str) -> str:
+    raw = str(model or "").strip()
+    if not raw:
+        return "gpt-5-2"
+    lowered = raw.lower()
+    return TOKEN_TEST_MODEL_ALIASES.get(lowered, lowered)
+
+
+def _build_chatgpt_token_headers(token_data: Dict[str, Any]) -> Dict[str, str]:
+    access_token = str(token_data.get("access_token") or "").strip()
+    account_id = str(token_data.get("account_id") or "").strip()
+    if not account_id and access_token:
+        auth_claims = _decode_jwt_payload(access_token).get("https://api.openai.com/auth") or {}
+        account_id = str(auth_claims.get("chatgpt_account_id") or "").strip()
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+        "Origin": "https://chatgpt.com",
+        "Referer": "https://chatgpt.com/",
+    }
+    if account_id:
+        headers["Chatgpt-Account-Id"] = account_id
+    return headers
+
+
+def _fetch_chatgpt_available_models(token_data: Dict[str, Any], proxy: str = "") -> Dict[str, Any]:
+    import requests as _requests
+
+    access_token = str(token_data.get("access_token") or "").strip()
+    if not access_token:
+        return {"ok": False, "models": [], "reason": "missing_access_token"}
+
+    session = _requests.Session()
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
+
+    try:
+        resp = session.get(
+            "https://chatgpt.com/backend-api/models?history_and_training_disabled=false",
+            headers=_build_chatgpt_token_headers(token_data),
             timeout=20,
         )
-        return {"ok": resp.status_code in (200, 201), "status": resp.status_code, "body": resp.text[:300]}
+        if resp.status_code != 200:
+            return {"ok": False, "models": [], "reason": f"chatgpt_models_http_{resp.status_code}"}
+        payload = resp.json()
+        model_ids = [
+            str(item.get("slug") or item.get("id") or "").strip()
+            for item in payload.get("models") or []
+            if isinstance(item, dict)
+        ]
+        sorted_models = _sort_token_test_models(model_ids)
+        return {"ok": bool(sorted_models), "models": sorted_models, "reason": "" if sorted_models else "models_empty"}
     except Exception as e:
-        return {"ok": False, "status": 0, "body": str(e)}
+        return {"ok": False, "models": [], "reason": str(e)}
+
+
+def _probe_accessible_test_models(access_token: str, proxy: str = "") -> List[str]:
+    import requests as _requests
+
+    session = _requests.Session()
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
+
+    accessible_models: List[str] = []
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    for model in TOKEN_TEST_MODEL_FALLBACKS:
+        try:
+            resp = session.post(
+                "https://api.openai.com/v1/responses",
+                headers=headers,
+                json={
+                    "model": model,
+                    "input": "ping",
+                    "max_output_tokens": 1,
+                },
+                timeout=20,
+            )
+            if resp.status_code == 200:
+                accessible_models.append(model)
+        except Exception:
+            continue
+    return accessible_models
+
+
+def _fetch_local_token_models(filename: str) -> Dict[str, Any]:
+    token_data = _load_local_token_data(filename)
+    proxy = _local_token_proxy()
+    validation = _validate_local_token_data(token_data, proxy)
+    warning = ""
+    if validation.get("ok"):
+        token_data = validation.get("token_data") or token_data
+        if validation.get("updated"):
+            fpath = os.path.join(TOKENS_DIR, filename)
+            with open(fpath, "w", encoding="utf-8") as f:
+                json.dump(token_data, f, ensure_ascii=False)
+    else:
+        warning = str(validation.get("reason") or "token_invalid")
+
+    access_token = str(token_data.get("access_token") or "").strip()
+    if not access_token:
+        return {
+            "ok": False,
+            "models": TOKEN_TEST_MODEL_FALLBACKS,
+            "warning": warning or "missing_access_token",
+            "source": "fallback",
+        }
+
+    chatgpt_models = _fetch_chatgpt_available_models(token_data, proxy)
+    if chatgpt_models.get("ok"):
+        return {
+            "ok": True,
+            "models": chatgpt_models.get("models") or TOKEN_TEST_MODEL_FALLBACKS,
+            "warning": warning,
+            "source": "chatgpt",
+        }
+
+    probed_models = _probe_accessible_test_models(access_token, proxy)
+    if probed_models:
+        return {
+            "ok": True,
+            "models": probed_models,
+            "warning": warning or chatgpt_models.get("reason", ""),
+            "source": "probe",
+        }
+
+    return {
+        "ok": False,
+        "models": TOKEN_TEST_MODEL_FALLBACKS,
+        "warning": warning or chatgpt_models.get("reason", "models_unavailable"),
+        "source": "fallback",
+    }
+
+
+def _test_local_token_connection(filename: str, model: str, prompt: str) -> Dict[str, Any]:
+    safe_filename = str(filename or "").strip()
+
+    logs: List[Dict[str, str]] = []
+    proxy = _local_token_proxy()
+    normalized_model = _normalize_token_test_model(model)
+    normalized_prompt = str(prompt or "hi").strip() or "hi"
+
+    logs.append({"level": "info", "message": f"开始测试账号：{safe_filename}"})
+    fpath = os.path.join(TOKENS_DIR, safe_filename)
+    token_data = _load_local_token_data(safe_filename)
+
+    email = str(token_data.get("email") or safe_filename).strip()
+    logs.append({"level": "info", "message": f"账号类型：OAUTH"})
+    logs.append({"level": "info", "message": f"账号邮箱：{email}"})
+
+    validation = _validate_local_token_data(token_data, proxy)
+    if validation.get("ok"):
+        updated = bool(validation.get("updated"))
+        token_data = validation.get("token_data") or token_data
+        if updated:
+            with open(fpath, "w", encoding="utf-8") as f:
+                json.dump(token_data, f, ensure_ascii=False)
+            logs.append({"level": "success", "message": "本地 Token 已自动刷新"})
+        else:
+            logs.append({"level": "success", "message": "本地 Token 校验通过"})
+    else:
+        reason = str(validation.get("reason") or "unknown")
+        logs.append({"level": "error", "message": f"本地 Token 校验失败：{reason}"})
+        return {
+            "ok": False,
+            "filename": safe_filename,
+            "email": email,
+            "model": normalized_model,
+            "prompt": normalized_prompt,
+            "status": "invalid",
+            "logs": logs,
+            "error": reason,
+        }
+
+    import requests as _requests
+
+    session = _requests.Session()
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
+
+    usage_resp = session.get(
+        "https://chatgpt.com/backend-api/wham/usage",
+        headers=_build_chatgpt_token_headers(token_data),
+        timeout=20,
+    )
+    logs.append({"level": "info", "message": f"已连接：API（usage {usage_resp.status_code}）"})
+    if usage_resp.status_code != 200:
+        logs.append({"level": "error", "message": f"Usage 检测失败：HTTP {usage_resp.status_code}"})
+        return {
+            "ok": False,
+            "filename": safe_filename,
+            "email": email,
+            "model": normalized_model,
+            "prompt": normalized_prompt,
+            "status": "error",
+            "logs": logs,
+            "error": f"usage_http_{usage_resp.status_code}",
+        }
+
+    usage_payload = usage_resp.json()
+    logs.append({"level": "info", "message": f"套餐类型：{usage_payload.get('plan_type') or 'unknown'}"})
+    models_result = _fetch_chatgpt_available_models(token_data, proxy)
+    available_models = models_result.get("models") or []
+    if available_models:
+        logs.append({"level": "success", "message": f"已获取可用模型列表：{len(available_models)} 个"})
+    else:
+        logs.append({"level": "error", "message": f"获取可用模型列表失败：{models_result.get('reason', 'unknown')}"})
+        return {
+            "ok": False,
+            "filename": safe_filename,
+            "email": email,
+            "model": normalized_model,
+            "prompt": normalized_prompt,
+            "status": "error",
+            "logs": logs,
+            "error": models_result.get("reason", "models_unavailable"),
+            "usage": {
+                "plan_type": usage_payload.get("plan_type"),
+                "allowed": ((usage_payload.get("rate_limit") or {}).get("allowed")),
+                "used_percent": (((usage_payload.get("rate_limit") or {}).get("primary_window") or {}).get("used_percent")),
+            },
+        }
+
+    logs.append({"level": "info", "message": f"使用模型：{normalized_model}"})
+    logs.append({"level": "info", "message": f"提示词：{normalized_prompt!r}"})
+
+    if normalized_model not in available_models:
+        logs.append({"level": "error", "message": f"当前账号不可用模型：{normalized_model}"})
+        return {
+            "ok": False,
+            "filename": safe_filename,
+            "email": email,
+            "model": normalized_model,
+            "prompt": normalized_prompt,
+            "status": "error",
+            "logs": logs,
+            "error": f"model_unavailable:{normalized_model}",
+            "usage": {
+                "plan_type": usage_payload.get("plan_type"),
+                "allowed": ((usage_payload.get("rate_limit") or {}).get("allowed")),
+                "used_percent": (((usage_payload.get("rate_limit") or {}).get("primary_window") or {}).get("used_percent")),
+            },
+            "available_models": available_models,
+        }
+
+    logs.append({"level": "success", "message": f"模型可用：{normalized_model}"})
+    logs.append({"level": "success", "message": "测试完成"})
+    return {
+        "ok": True,
+        "filename": safe_filename,
+        "email": email,
+        "model": normalized_model,
+        "prompt": normalized_prompt,
+        "status": "active",
+        "logs": logs,
+        "usage": {
+            "plan_type": usage_payload.get("plan_type"),
+            "allowed": ((usage_payload.get("rate_limit") or {}).get("allowed")),
+            "used_percent": (((usage_payload.get("rate_limit") or {}).get("primary_window") or {}).get("used_percent")),
+        },
+        "available_models": available_models,
+    }
+
+
+@app.post("/api/tokens/import-batch")
+async def api_import_batch(req: BatchImportRequest) -> Dict[str, Any]:
+    mode = _normalize_upload_mode(req.mode)
+    if mode not in UPLOAD_MODES:
+        raise HTTPException(status_code=400, detail="mode 仅支持 cpa_only / sub2api_only / parallel")
+
+    target_filenames = _load_batch_import_targets(req.filenames)
+    pm = _get_pool_maintainer()
+    base_url = str(_sync_config.get("base_url", "") or "").strip()
+    bearer = str(_sync_config.get("bearer_token", "") or "").strip()
+    has_sub2api = bool(base_url and (bearer or (str(_sync_config.get("email") or "").strip() and str(_sync_config.get("password") or "").strip())))
+
+    if mode in (UPLOAD_MODE_CPA_ONLY, UPLOAD_MODE_PARALLEL) and not pm:
+        raise HTTPException(status_code=400, detail="CPA 未配置")
+    if mode in (UPLOAD_MODE_SUB2API_ONLY, UPLOAD_MODE_PARALLEL) and not has_sub2api:
+        raise HTTPException(status_code=400, detail="Sub2Api 未配置")
+
+    results = []
+    for fname in target_filenames:
+        if "/" in fname or "\\" in fname or ".." in fname:
+            continue
+        fpath = os.path.join(TOKENS_DIR, fname)
+        if not os.path.isfile(fpath):
+            results.append({"file": fname, "ok": False, "error": "文件不存在"})
+            continue
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                token_data = json.load(f)
+            if not isinstance(token_data, dict):
+                results.append({"file": fname, "ok": False, "error": "文件内容无效"})
+                continue
+            email = token_data.get("email", fname)
+            existing_platforms = set(_extract_uploaded_platforms(token_data))
+            item_result: Dict[str, Any] = {"file": fname, "email": email}
+
+            if mode in (UPLOAD_MODE_CPA_ONLY, UPLOAD_MODE_PARALLEL):
+                if "cpa" in existing_platforms:
+                    item_result["cpa"] = {"ok": True, "skipped": True}
+                else:
+                    cpa_ok = pm.upload_token(fname, token_data, proxy=_local_token_proxy()) if pm else False
+                    item_result["cpa"] = {"ok": cpa_ok, "skipped": False}
+                    if cpa_ok:
+                        _mark_token_uploaded_platform(fpath, "cpa")
+
+            if mode in (UPLOAD_MODE_SUB2API_ONLY, UPLOAD_MODE_PARALLEL):
+                if "sub2api" in existing_platforms:
+                    item_result["sub2api"] = {"ok": True, "skipped": True}
+                else:
+                    sub_result = _push_sub2api_token(base_url, bearer, email, token_data)
+                    item_result["sub2api"] = sub_result
+                    if sub_result.get("ok"):
+                        _mark_token_uploaded_platform(fpath, "sub2api")
+
+            platform_results = []
+            if "cpa" in item_result:
+                platform_results.append(bool(item_result["cpa"].get("ok")))
+            if "sub2api" in item_result:
+                platform_results.append(bool(item_result["sub2api"].get("ok")))
+            item_result["ok"] = all(platform_results) if platform_results else False
+            results.append(item_result)
+        except Exception as e:
+            results.append({"file": fname, "ok": False, "error": str(e)})
+
+    ok_count = sum(1 for item in results if item.get("ok"))
+    fail_count = sum(1 for item in results if not item.get("ok"))
+    return {"total": len(results), "ok": ok_count, "fail": fail_count, "mode": mode, "results": results}
 
 
 @app.post("/api/sync-batch")
@@ -1729,7 +2507,7 @@ async def api_sync_batch(req: BatchSyncRequest) -> Dict[str, Any]:
             if _is_sub2api_uploaded(token_data):
                 results.append({"file": fname, "email": email, "ok": True, "skipped": True})
                 continue
-            result = _push_account_api(base_url, bearer, email, token_data)
+            result = _push_sub2api_token(base_url, bearer, email, token_data)
             results.append({"file": fname, "email": email, **result})
             if result["ok"]:
                 _mark_token_uploaded_platform(fpath, "sub2api")
@@ -1869,25 +2647,21 @@ async def api_pool_auto(enable: bool = True) -> Dict[str, Any]:
 async def api_get_mail_config() -> Dict[str, Any]:
     cfg = _sync_config
     # 兼容旧格式
-    mail_cfg = dict(cfg.get("mail_config") or {})
-    token = str(mail_cfg.get("bearer_token", ""))
-    mail_cfg["bearer_token_preview"] = (token[:12] + "...") if len(token) > 12 else token
-    mail_cfg.pop("bearer_token", None)
-    key = str(mail_cfg.get("api_key", ""))
-    mail_cfg["api_key_preview"] = (key[:8] + "...") if len(key) > 8 else key
-    mail_cfg.pop("api_key", None)
+    mail_cfg = _mask_secret_dict(
+        cfg.get("mail_config") or {},
+        secret_keys=("bearer_token", "api_key", "admin_password"),
+        preview_lengths={"bearer_token": 12, "api_key": 8, "admin_password": 8},
+    )
 
     # 脱敏 provider_configs 中的敏感字段
     raw_configs = cfg.get("mail_provider_configs") or {}
     safe_configs: Dict[str, Dict] = {}
     for pname, pcfg in raw_configs.items():
-        sc = dict(pcfg)
-        for secret_key in ("bearer_token", "api_key"):
-            val = str(sc.get(secret_key, ""))
-            if val:
-                sc[f"{secret_key}_preview"] = (val[:8] + "...") if len(val) > 8 else val
-                sc.pop(secret_key, None)
-        safe_configs[pname] = sc
+        safe_configs[pname] = _mask_secret_dict(
+            pcfg,
+            secret_keys=("bearer_token", "api_key", "admin_password"),
+            preview_lengths={"bearer_token": 12, "api_key": 8, "admin_password": 8},
+        )
 
     return {
         "mail_provider": cfg.get("mail_provider", "mailtm"),
@@ -1968,9 +2742,6 @@ def _try_auto_register() -> None:
             "step": "auto_register",
         })
         return
-    upload_mode = str(_sync_config.get("upload_mode", "snapshot") or "snapshot").strip().lower()
-    if upload_mode not in ("snapshot", "decoupled"):
-        upload_mode = "snapshot"
     gap = 0
     cpa_gap = 0
     sub2api_gap = 0
@@ -1987,7 +2758,7 @@ def _try_auto_register() -> None:
                 "step": "auto_register",
             })
     sm = _get_sub2api_maintainer()
-    if sm and _sync_config.get("auto_sync", "true") == "true":
+    if sm and _flag_enabled(_sync_config.get("auto_sync", "false")):
         try:
             sub2api_gap = sm.calculate_gap()
         except Exception as e:
@@ -2003,7 +2774,16 @@ def _try_auto_register() -> None:
             "message": "[AUTO] Sub2Api 自动同步未开启，自动补号仅按 CPA 缺口执行",
             "step": "auto_register",
         })
-    gap = (cpa_gap + sub2api_gap) if upload_mode == "snapshot" else max(cpa_gap, sub2api_gap)
+    auto_upload_mode = UPLOAD_MODE_PARALLEL
+    if cpa_gap > 0 and sub2api_gap > 0:
+        gap = max(cpa_gap, sub2api_gap)
+        auto_upload_mode = UPLOAD_MODE_PARALLEL
+    elif cpa_gap > 0:
+        gap = cpa_gap
+        auto_upload_mode = UPLOAD_MODE_CPA_ONLY
+    elif sub2api_gap > 0:
+        gap = sub2api_gap
+        auto_upload_mode = UPLOAD_MODE_SUB2API_ONLY
     if api_error and gap <= 0:
         return
     if gap <= 0:
@@ -2022,13 +2802,14 @@ def _try_auto_register() -> None:
             thread_count,
             target_count=gap,
             cpa_target_count=cpa_gap if pm else 0,
-            sub2api_target_count=sub2api_gap if sm and _sync_config.get("auto_sync", "true") == "true" else 0,
+            sub2api_target_count=sub2api_gap if sm and _flag_enabled(_sync_config.get("auto_sync", "false")) else 0,
+            upload_mode_override=auto_upload_mode,
         )
         _state.broadcast({
             "ts": ts, "level": "success",
             "message": (
                 f"[AUTO] 自动注册已启动：总补充 {gap}（CPA 缺口 {cpa_gap} / Sub2Api 缺口 {sub2api_gap} / "
-                f"策略 {upload_mode}）"
+                f"策略 {_upload_mode_label(auto_upload_mode)}）"
             ),
             "step": "auto_register",
         })

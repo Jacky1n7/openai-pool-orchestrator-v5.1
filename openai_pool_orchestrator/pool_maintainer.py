@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import re
@@ -484,7 +485,87 @@ class Sub2ApiMaintainer:
             page += 1
         return result
 
-    def probe_and_clean_sync(self, timeout: int = 15) -> Dict[str, Any]:
+    def _get_accounts_by_ids(
+        self, ids: List[int], timeout: int = 15,
+    ) -> Dict[int, Dict[str, Any]]:
+        result: Dict[int, Dict[str, Any]] = {}
+        id_set = set(ids)
+        page = 1
+        while id_set:
+            data = self.list_accounts(page=page, page_size=100, timeout=timeout)
+            items = data.get("items") or []
+            if not items:
+                break
+            for item in items:
+                aid = item.get("id")
+                if aid in id_set:
+                    result[aid] = item
+                    id_set.discard(aid)
+            total = data.get("total", 0)
+            if page * 100 >= total or len(items) < 100:
+                break
+            page += 1
+        return result
+
+    def _probe_account_health(self, item: Dict[str, Any], timeout: int = 15) -> Dict[str, Any]:
+        account_id = item.get("id")
+        status = str(item.get("status", "") or "").strip().lower()
+        result = {
+            "id": account_id,
+            "name": item.get("name") or item.get("id"),
+            "status": status,
+            "invalid": False,
+            "probe_error": "",
+            "http_status": 0,
+        }
+
+        if status in ("error", "disabled"):
+            result["invalid"] = True
+            result["probe_error"] = f"platform_status:{status}"
+            return result
+
+        credentials = item.get("credentials") or {}
+        if not isinstance(credentials, dict):
+            result["invalid"] = True
+            result["probe_error"] = "missing_credentials"
+            return result
+
+        access_token = str(credentials.get("access_token") or "").strip()
+        if not access_token:
+            result["invalid"] = True
+            result["probe_error"] = "missing_access_token"
+            return result
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": DEFAULT_MGMT_UA,
+        }
+        account_token_id = str(credentials.get("chatgpt_account_id") or "").strip()
+        if account_token_id:
+            headers["Chatgpt-Account-Id"] = account_token_id
+
+        try:
+            with _build_session() as session:
+                resp = session.get(
+                    "https://chatgpt.com/backend-api/wham/usage",
+                    headers=headers,
+                    timeout=timeout,
+                )
+            result["http_status"] = int(resp.status_code or 0)
+            if resp.status_code == 200:
+                return result
+            if resp.status_code == 401:
+                result["invalid"] = True
+                result["probe_error"] = f"http_{resp.status_code}"
+                return result
+            result["probe_error"] = f"http_{resp.status_code}"
+            return result
+        except Exception as e:
+            result["probe_error"] = str(e)
+            return result
+
+    def probe_and_clean_sync(self, timeout: int = 15, workers: int = 20) -> Dict[str, Any]:
         all_accounts: List[Dict[str, Any]] = []
         page = 1
         page_size = 100
@@ -499,23 +580,40 @@ class Sub2ApiMaintainer:
                 break
             page += 1
 
-        error_accounts = [
-            a for a in all_accounts
-            if str(a.get("status", "")).lower() in ("error", "disabled")
-        ]
-        normal_count = len(all_accounts) - len(error_accounts)
+        if not all_accounts:
+            return {
+                "total": 0, "normal": 0,
+                "error_count": 0, "refreshed": 0,
+                "deleted_ok": 0, "deleted_fail": 0,
+                "probe_errors": 0,
+            }
 
-        if not error_accounts:
+        probe_results: List[Dict[str, Any]] = []
+        max_workers = max(1, min(int(workers or 20), 50))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(self._probe_account_health, acc, timeout)
+                for acc in all_accounts
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                probe_results.append(future.result())
+
+        invalid_accounts = [r for r in probe_results if r.get("invalid")]
+        probe_errors = sum(1 for r in probe_results if r.get("probe_error") and not r.get("invalid"))
+        normal_count = len(all_accounts) - len(invalid_accounts)
+
+        if not invalid_accounts:
             return {
                 "total": len(all_accounts), "normal": normal_count,
                 "error_count": 0, "refreshed": 0,
                 "deleted_ok": 0, "deleted_fail": 0,
+                "probe_errors": probe_errors,
             }
 
-        # 尝试刷新所有异常账号
+        # 尝试刷新所有明确失效的账号
         refreshed_ids = []
         refresh_failed: List[Dict[str, Any]] = []
-        for acc in error_accounts:
+        for acc in invalid_accounts:
             acc_id = acc.get("id")
             if not acc_id:
                 refresh_failed.append(acc)
@@ -525,22 +623,30 @@ class Sub2ApiMaintainer:
             else:
                 refresh_failed.append(acc)
 
-        # 等待刷新生效后重新查询状态，确认是否真正恢复
+        # 等待刷新生效后重新探测，确认是否真正恢复
         still_error: List[Dict[str, Any]] = list(refresh_failed)
         if refreshed_ids:
             time.sleep(2)
-            recheck = self._list_accounts_by_ids(refreshed_ids, timeout=timeout)
+            refreshed_accounts = self._get_accounts_by_ids(refreshed_ids, timeout=timeout)
             recovered = 0
-            for acc_id in refreshed_ids:
-                acc_status = recheck.get(acc_id, "error")
-                if str(acc_status).lower() in ("error", "disabled"):
-                    still_error.append({"id": acc_id})
-                else:
-                    recovered += 1
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for acc_id in refreshed_ids:
+                    refreshed_item = refreshed_accounts.get(acc_id)
+                    if not refreshed_item:
+                        still_error.append({"id": acc_id, "probe_error": "account_not_found_after_refresh"})
+                        continue
+                    futures.append(executor.submit(self._probe_account_health, refreshed_item, timeout))
+                for future in concurrent.futures.as_completed(futures):
+                    result = future.result()
+                    if result.get("invalid"):
+                        still_error.append(result)
+                    else:
+                        recovered += 1
         else:
             recovered = 0
 
-        # 删除不可恢复的账号
+        # 删除刷新后仍不可恢复的账号
         deleted_ok = 0
         deleted_fail = 0
         for acc in still_error:
@@ -555,8 +661,9 @@ class Sub2ApiMaintainer:
 
         return {
             "total": len(all_accounts), "normal": normal_count,
-            "error_count": len(error_accounts), "refreshed": recovered,
+            "error_count": len(invalid_accounts), "refreshed": recovered,
             "deleted_ok": deleted_ok, "deleted_fail": deleted_fail,
+            "probe_errors": probe_errors,
         }
 
     def calculate_gap(self, current_candidates: Optional[int] = None) -> int:
